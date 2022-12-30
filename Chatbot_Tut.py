@@ -337,9 +337,22 @@ class EncoderRNN(nn.Module):
         self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=(0 if n_layers==1 else dropout),
                           bidirectional=True)
 
-    def forward(self, input_seq, input_lengths, hidden=None):
+    def forward(self, inputSeq, inputLengths, hidden=None):
         #convert word indexes to embeddings
-        embedded = self.embedding(input_seq)
+        embedded = self.embedding(inputSeq)
+
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, inputLengths)
+
+        #Forward pass through GRU
+        outputs, hidden = self.gru(packed, hidden)
+
+        #Unpack padding
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs)
+
+        #Sum bidirectional GRU outputs
+        outputs = outputs[:, :, :self.hidden_size] + outputs[:, :, self.hidden_size:]
+
+        return outputs, hidden
 
 
 #luong attention layer
@@ -387,7 +400,7 @@ class Attention(nn.Module):
         attentionEnergies=attentionEnergies.t()
         #Transposes MAX_LENGTH and BATCH_SIZE dimensions
 
-        return F.softmax()(attentionEnergies, dim=1).unsqueeze(1)
+        return F.softmax(attentionEnergies, dim=1).unsqueeze(1)
         #Return softmax normalized probability scores with added dimensions
 
 
@@ -441,3 +454,310 @@ class LuongAttentionDecoderRNN(nn.Module):
         #Return output and final hidden state
         return output, hidden
 
+#Calculates average negative log probability of elements == 1 in the masked tensor (Masked Loss)
+def maskNLLLoss(input, target, mask):
+    nTotal=mask.sum()
+    crossEntropy = -torch.log(torch.gather(input, 1, target.view(-1,1)).squeeze(1))
+    loss=crossEntropy.masked_select(mask).mean()
+    return loss, nTotal.item()
+
+
+#Training
+#Single training iteration
+
+def train(inputVariable, lengths, targetVariable, mask, maxTargetLength, encoder, decoder, embedding, encoderOptimizer,
+          decoderOptimizer, batchSize, clip, maxLength=MAX_TARGET_LENGTH):
+
+    #Zero gradients
+    encoderOptimizer.zero_grad()
+    decoderOptimizer.zero_grad()
+
+    #Set device options
+    inputVariable=inputVariable.to(device)
+    targetVariable=targetVariable.to(device)
+    mask=mask.to(device)
+
+    #Length for RNN packing runs on the CPU
+    #Adds padding to input data so all have the same size (if the length of sequences in a size 8 batch is [4,6,8,5,4,3,7,8],
+    # you will pad all the sequences and that will result in 8 sequences of length 8)
+    lengths=lengths.to("cpu")
+
+    loss=0
+    printLosses=[]
+    nTotals=0
+
+    #Forward pass through encoder
+    '''print("-------stopping------")
+    print(encoder)
+    print(inputVariable)
+    print(lengths)'''
+    encoderOutputs, encoderHidden = encoder(inputVariable, lengths)
+
+    #Creates initial decoder input (with SOS tokens for each sentence)
+    decoderInput=torch.LongTensor([[StartSentence_token for _ in range(batchSize)]])
+    decoderInput=decoderInput.to(device)
+
+    #Set initial decoder hidden state to encoder final hidden state
+    decoderHidden=encoderHidden[:decoder.nLayers]
+
+    useTeacherForcing=True if random.random() < teacherForcingRatio else False
+
+    if useTeacherForcing:
+        for time in range(maxTargetLength):
+            decoderOutput, decoderHidden = decoder(
+                decoderInput, decoderHidden, encoderOutputs
+            )
+
+            #Teacher forcing definition: next input is current target
+            decoderInput=targetVariable[time].view(1,-1)
+
+            #Calculate/accumulate loss
+            maskLoss, nTotal = maskNLLLoss(decoderOutput, targetVariable[time], mask[time])
+            loss+=maskLoss
+            printLosses.append(maskLoss.item() * nTotal)
+            nTotals+=nTotal
+    else:
+        for time in range(maxTargetLength):
+            decoderOutput, decoderHidden=decoder(
+                decoderInput, decoderHidden, encoderOutputs
+            )
+
+            #As no teacher forcing, so next input is decoder's own current output
+            _, topi=decoderOutput.topk(1)
+            decoderInput=torch.LongTensor([topi[i][0] for i in range(batchSize)])
+            decoderInput.to(device)
+
+            maskLoss, nTotal=maskNLLLoss(decoderOutput, targetVariable[time], mask[time])
+            loss+=maskLoss
+            printLosses.append(maskLoss.item() * nTotal)
+            nTotals+=nTotal
+
+    #Backpropagation
+    loss.backward()
+
+    #Clip gradients to reduce thresholidng gradients and prevent exploding gradient
+    _ = nn.utils.clip_grad_norm_(encoder.parameters(), clip)
+    _ = nn.utils.clip_grad_norm_(decoder.parameters(), clip)
+
+    #Adjust model weights
+    encoderOptimizer.step()
+    decoderOptimizer.step()
+
+    return sum(printLosses) / nTotals
+
+def trainIters(modelName, vocabulary, pairs, encoder, decoder, encoderOptimizer, decoderOptimizer, embedding, encoderNLayers, decoderNLayers, saveDir,
+               nIteration, batchSize, printEvery, saveEvery, clip, corpus_name, loadFilename):
+
+    trainingBatches = [batch2TrainData(vocabulary, [random.choice(pairs) for _ in range(batchSize)])
+                       for _ in range(nIteration)]
+
+    print("Initializing ...")
+    startIteration=1
+    printLoss=0
+
+    if loadFilename:
+        startIteration=checkpoint['iteration']+1
+
+    print("Training...")
+    for iteration in range(startIteration, nIteration+1):
+        targetBatch = trainingBatches[iteration-1]
+
+        inputVariable, lengths, targetVariable, mask, maxTargetLen=targetBatch
+
+        loss=train(inputVariable, lengths, targetVariable, mask, maxTargetLen, encoder,
+                   decoder, embedding, encoderOptimizer, decoderOptimizer, batchSize, clip)
+
+        printLoss+=loss
+
+        if iteration%printEvery==0:
+            printLossAvg = printLoss/printEvery
+            print("Iteration: {}; Percent complete: {:.1f}%; Average loss: {:.4f}".format(iteration,
+                        iteration/nIteration*100, printLossAvg))
+
+            printLoss=0
+
+        #Save checkpoint
+        if(iteration%saveEvery==0):
+            directory=os.path.join(saveDir, modelName, corpus_name, '{}-{}_{}'.format(
+                encoderNLayers, decoderNLayers, hiddenSize))
+
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+            torch.save({
+                'iteration': iteration,
+                'en': encoder.state_dict(),
+                'de': decoder.state_dict(),
+                'en_opt': encoderOptimizer.state_dict(),
+                'de_opt': decoderOptimizer.state_dict(),
+                'loss': loss,
+                'voc_dict': vocabulary.__dict__,
+                'embedding': embedding.state_dict()
+            }, os.path.join(directory, '{}_{}.tar'.format(iteration, 'checkpoint')))
+
+
+#Greedy decoding
+
+class GreedySearchDecoder(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(GreedySearchDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, inputSequence, inputLength, maxLength):
+        #Forward input through encoder
+        encoderOutput, encoderHidden = self.encoder(inputSequence, inputLength)
+
+        #Prepare encoder's final hidden layer to be decoder first hidden layer
+        decoderHidden = encoderHidden[:decoder.nLayers]
+
+        decoderInput = torch.ones(1,1, device=device, dtype=torch.long) * StartSentence_token
+
+        #Initialize tensors to append decoded words
+        allTokens = torch.zeros([0], device=device, dtype=torch.long)
+        allScores = torch.zeros([0], device=device)
+
+        #Iterate decode one word token at a time
+        for _ in range(maxLength):
+            decoderOutput, decoderHidden = self.decoder(decoderInput, decoderHidden, encoderOutput)
+
+            #Find most likely word token and its softmax score
+            decoderScpres, decoderInput = torch.max(decoderOutput, dim=1)
+
+            allTokens = torch.cat((allTokens, decoderInput), dim=0)
+            allScores = torch.cat((allScores, decoderScpres), dim=0)
+
+            decoderInput = torch.unsqueeze(decoderInput, 0)
+
+        return allTokens, allScores
+
+
+#Evaluating input text and returning chatbot response
+def evaluate(encoder, decoder, searcher, vocabulary, sentence, maxLength = MAX_SENTENCE_LENGTH):
+    #Converts sentence string to contain word index of in the gathered vocabulary
+    indexesBatch = [indexesFromSentence(vocabulary, sentence)]
+
+    lengths = torch.tensor([len(indexes) for indexes in indexesBatch])
+    inputBatch = torch.LongTensor(indexesBatch).transpose(0, 1)
+
+    inputBatch = inputBatch.to(device)
+    lengths = lengths.to("cpu")
+
+    #Decode sentence with searcher method
+    tokens, scores = searcher(inputBatch, lengths, maxLength)
+
+    decodedWords = [vocabulary.index2word[token.item()] for token in tokens]
+    return decodedWords
+
+
+#Acts as user interface for user inputing query and recieving chatbot response
+def evaluateInterface(encoder, decoder, searcher, vocabulary):
+    inputSentence = ''
+    while(1):
+        try:
+            inputSentence = input('> ')
+
+            if inputSentence == 'q' or inputSentence == 'quit':
+                break
+
+            inputSentence = normalizeString(inputSentence)
+            outputWords = evaluate(encoder, decoder, searcher, vocabulary, inputSentence)
+
+            outputWords[:] = [x for x in outputWords if not (x == 'EQS' or x == 'PAD')]
+            print("Bot: ", ' '.join(outputWords))
+
+        except KeyError:
+            print("Error: Encountered unknown word or other error")
+
+
+#Running the model
+
+#Configuration
+modelName = 'chatbot_model'
+attentionModel = 'dot'
+
+hiddenSize = 500
+encoderNLayers = 2
+decoderNLayers = 2
+dropout = 0.1
+batchsize = 64
+
+#Set checkpoint to load from, or load from scratch if None
+loadFilename = None
+checkpointIteration = 4000
+
+
+if loadFilename:
+    checkpoint = torch.load(loadFilename)
+
+    #If loading model trained on GPU to CPU
+    encoderSD = checkpoint['en']
+    decoderSD = checkpoint['de']
+    encoderOptimizerSD = checkpoint['en_opt']
+    decoderOptimizerSD = checkpoint['de_opt']
+    embeddingSD = checkpoint['embedding']
+    vocabulary.__dict__ = checkpoint['voc_dict']
+    #SD for saved data?
+
+
+print("Builidng encoder and decoder ...")
+
+embedding = nn.Embedding(vocabulary.num_words, hiddenSize)
+if loadFilename:
+    embedding.load_state_dict(embeddingSD)
+
+#initialize encoder and decoder models
+encoder = EncoderRNN(hiddenSize, embedding, encoderNLayers, dropout)
+decoder = LuongAttentionDecoderRNN(attentionModel, embedding, hiddenSize, vocabulary.num_words, decoderNLayers,
+                                   dropout)
+
+if loadFilename:
+    encoder.load_state_dict(encoderSD)
+    decoder.load_state_dict(decoderSD)
+
+encoder = encoder.to(device)
+decoder = decoder.to(device)
+print("Models built and ready ...")
+
+
+#Training
+
+#Configurations
+clip = 50.0
+teacherForcingRatio = 1.0
+learningRate = 0.0001
+decoderLearningRatio = 5.0
+nIteration = 4000
+printEvery = 1
+saveEvery = 500
+
+encoder.train()
+decoder.train()
+
+print('Building optimizers ...')
+encoderOptimizer = optim.Adam(encoder.parameters(), lr=learningRate)
+decoderOptimizer = optim.Adam(decoder.parameters(), lr=learningRate*decoderLearningRatio)
+
+if loadFilename:
+    encoderOptimizer.load_state_dict(encoderOptimizerSD)
+    decoderOptimizer.load_state_dict(decoderOptimizerSD)
+
+#Configure cuda
+for state in encoderOptimizer.state.values():
+    for k, v in state.items():
+        state[k] = v.cuda()
+
+for state in decoderOptimizer.state.values():
+    for k, v in state.items():
+        state[k] = v.cuda()
+
+print("Starting Training")
+#print(encoder)
+trainIters(modelName, vocabulary, pairs, encoder, decoder, encoderOptimizer, decoderOptimizer, embedding, encoderNLayers,
+           decoderNLayers, save_directory, nIteration, batchsize, printEvery, saveEvery, clip, corpus_name, loadFilename)
+
+
+ENCODER_FILE = "models/chatbot_encoder.pth"
+DECODER_FILE = "models/chatbot_decoder.pth"
+
+torch.save(encoder.state_dict(), ENCODER_FILE)
+torch.save(decoder.state_dict(), DECODER_FILE)
