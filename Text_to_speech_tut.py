@@ -31,7 +31,7 @@ text = "Hello world! Text to speech!"
 
 
 #Phoneme-based encoding, based on sound of words
-'''
+
 bundle = torchaudio.pipelines.TACOTRON2_WAVERNN_PHONE_LJSPEECH
 
 processor = bundle.get_text_processor()
@@ -117,23 +117,24 @@ with torch.inference_mode():
 waveglow = torch.hub.load('NVIDIA/DeepLearningExamples:torchhub', 'nvidia_waveglow', model_math='fp32')
 
 '''
-else:
-    print("Using URL")
-    waveglow = torch.hub.load(
-        "NVIDIA/DeepLearningExamples:torchhub",
-        "nvidia_waveglow",
-        model_math="fp32",
-        pretrained=False,
-    )
-
-    checkpoint = torch.hub.load_state_dict_from_url(
-        "https://api.ngc.nvidia.com/v2/models/nvidia/waveglow_ckpt_fp32/versions/19.09.0/files/nvidia_waveglowpyt_fp32_20190427",
-        progress=False,
-        map_location=device,
-    )
-
-    state_dict = {key.replace("module.", ""): value for key, value in checkpoint["state_dict"].items()}
 '''
+
+print("Using URL")
+waveglow = torch.hub.load(
+    "NVIDIA/DeepLearningExamples:torchhub",
+    "nvidia_waveglow",
+    model_math="fp32",
+    pretrained=False,
+)
+
+checkpoint = torch.hub.load_state_dict_from_url(
+    "https://api.ngc.nvidia.com/v2/models/nvidia/waveglow_ckpt_fp32/versions/19.09.0/files/nvidia_waveglowpyt_fp32_20190427",
+    progress=False,
+    map_location=device,
+)
+
+state_dict = {key.replace("module.", ""): value for key, value in checkpoint["state_dict"].items()}
+
 waveglow_time = time.time()
 
 waveglow = waveglow.remove_weightnorm(waveglow)
