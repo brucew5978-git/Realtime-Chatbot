@@ -46,6 +46,12 @@ userResponse = ''
 
 while(userResponse != "q"):
     
+    '''
+    userVoiceInput = input(">")
+    chatbotResponse = evaluateInterface(encoder, decoder, searcher, vocabulary, userVoiceInput) 
+    print("Chatbot: " + chatbotResponse) 
+    '''
+
     print("Recieving audio data...")
     #Recording user voice
     myRecording = sounddevice.rec(int(seconds*sampleRate), samplerate=sampleRate, channels=1)
@@ -70,4 +76,5 @@ while(userResponse != "q"):
     
     #if(userResponse == "q"):
     #    break
+    
 
