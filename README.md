@@ -18,5 +18,13 @@ Text_To_Speech.py: Synthesizes text from using pretrained TTS model for chatbot 
 
 Chatbot_converse.py: Utilizes all three files to run the chatbot program
 
+## Results and Next Steps
+
+The model is able to properly recognize human speech input and generate interesting and understandable responses (examples of chatbot text response shown below). However, due to the chatbot architecture, as well as the speech synthesis process, the turn-around time from user input, to chatbot output takes around 18 seconds which is a significant amount of time. 
+
+<img width="362" alt="image" src="https://user-images.githubusercontent.com/83440706/215196992-c16d70f2-ca09-46d4-9594-e5106ecf9289.png">
+
+In my upcoming project, I plan to address these problems as well as implement a diffusion models for better results.
+
 
 
